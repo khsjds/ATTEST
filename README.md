@@ -178,4 +178,4 @@ model design documentation.
 
 ## License
 
-To be determined prior to publication.
+MIT — see [LICENSE](LICENSE).
