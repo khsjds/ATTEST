@@ -41,7 +41,7 @@ ATTEST/
 ├── benchmarks/
 │   ├── bench_attest.py   CLI benchmark (all 6 sections)
 │   ├── attest_benchmark.ipynb   Google Colab notebook
-│   └── make_colab_zip.sh        Package source for Colab upload
+│   └── attest_benchmark.ipynb   Google Colab notebook (auto-clones dependencies)
 ├── tests/
 │   ├── test_bloom.py     Bloom filter unit tests (7)
 │   └── test_protocol.py  Protocol integration tests (26)
@@ -149,15 +149,7 @@ python3 benchmarks/bench_attest.py --quick  # set1 (fast check)
 ### Google Colab
 
 Open `benchmarks/attest_benchmark.ipynb` in Google Colab and run all cells.
-The setup cell handles dependency installation automatically.
-
-To use before the COMPASS repo is public, create a source zip locally:
-
-```bash
-sh benchmarks/make_colab_zip.sh   # → attest_src.zip
-```
-
-Then upload it when the setup cell prompts.
+The setup cell automatically clones both ATTEST and COMPASS from GitHub — no manual file upload needed.
 
 ---
 
