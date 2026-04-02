@@ -176,20 +176,6 @@ model design documentation.
 
 ---
 
-## Citation
-
-```bibtex
-@article{attest2026,
-  title   = {{ATTEST}: Accumulator-based Post-Quantum Verifiable Credential
-             Revocation for {IoT}},
-  author  = {<authors>},
-  journal = {IEEE Transactions on Information Forensics and Security},
-  year    = {2026},
-}
-```
-
----
-
 ## License
 
 To be determined prior to publication.
