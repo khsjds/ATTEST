@@ -63,8 +63,8 @@ ATTEST depends on [COMPASS](https://github.com/your-org/COMPASS).
 Clone both repositories side-by-side:
 
 ```bash
-git clone https://github.com/your-org/COMPASS.git
-git clone https://github.com/your-org/ATTEST.git
+git clone https://github.com/khsjds/COMPASS.git
+git clone https://github.com/khsjds/ATTEST.git
 
 cd ATTEST
 pip install -r requirements.txt
