@@ -1,0 +1,175 @@
+/*
+  ATTEST Liveness Model — Combined
+  =================================
+  Proves both exists-trace lemmas from attest_baseline.spthy in one file:
+    - completeness_witness
+    - collusion_bounded_witness
+
+  WHY A SEPARATE FILE IS NEEDED
+  ------------------------------
+  Both lemmas are non-terminating in attest_baseline.spthy due to DeviceState
+  loop-breakers under backward proof search. See tamarin-patterns.md Bug #10.
+
+  HOW THE LOOP-BREAKERS ARE ELIMINATED
+  --------------------------------------
+  Loop-breaker         Fix
+  ─────────────────────────────────────────────────────────────────────
+  EpochCommit          Concrete 'e0'→'e1' (no ManagerState chain)
+  DevicePrepareRequest UniqueUpdateRequest (depth-1 bound)
+  ForwardUpdate        Use !HonestDevice(to) instead of DeviceState(to,'e0')
+                       → ForwardUpdate no longer touches DeviceState → NOT a
+                         loop-breaker; DeviceState(to,'e0') survives for ApplyUpdate
+  InteractSuccess      One-shot (DeviceState consumed, not reproduced)
+  ApplyUpdate          Concrete epochs 'e0'→'e1' (different input/output)
+
+  WHY !HonestDevice REPLACES DeviceState IN ForwardUpdate
+  --------------------------------------------------------
+  Original full model: ForwardUpdate reads DeviceState(to,eT) and reproduces it.
+  This creates a DeviceState loop-breaker. In backward search for completeness_witness
+  (which has no ForwardUpdate action in its formula), Tamarin branches on ForwardUpdate
+  as a potential DeviceState source → exponential blowup.
+
+  Fix: IssueDevice already produces !HonestDevice(to) (persistent). Using it in
+  ForwardUpdate's premiss removes the loop-breaker while preserving soundness:
+    - !HonestDevice(to) → to was issued at 'e0' → DeviceState(to,'e0') exists
+    - ForwardUpdate no longer touches DeviceState → DeviceState(to,'e0') remains
+      available for ApplyUpdate to consume
+    - UniqueForwardTo bounds ForwardUpdate to at most one per (to, epoch)
+
+  SOUNDNESS
+  ---------
+  Target traces satisfy all restrictions. With 'e1' := s('e0'), the witness traces
+  are valid executions of attest_baseline.spthy (same rule applications, concrete
+  epoch instantiation). The !HonestDevice relaxation is sound for exists-trace:
+  the full model's ForwardUpdate with DeviceState(to,'e0') fires in the same trace.
+*/
+theory ATTEST_Liveness
+begin
+builtins: hashing, signing
+heuristic: s
+
+restriction Equality:
+  "All x y #i. Eq(x,y)@#i ==> x = y"
+restriction UniqueReqAccepted:
+  "All rid #i #j. ReqAccepted(rid)@#i & ReqAccepted(rid)@#j ==> #i = #j"
+// Bounds DevicePrepareRequest loop-breaker to depth 1.
+restriction UniqueUpdateRequest:
+  "All i e #t1 #t2. UpdateRequest(i,e)@#t1 & UpdateRequest(i,e)@#t2 ==> #t1 = #t2"
+// Bounds ForwardUpdate to at most one per (to, epoch).
+restriction UniqueForwardTo:
+  "All fwd1 fwd2 to e #t1 #t2.
+      ForwardUpdate(fwd1,to,e)@#t1 & ForwardUpdate(fwd2,to,e)@#t2 ==> #t1 = #t2"
+
+rule Init:
+  [ Fr(~skM), Fr(~acc0), Fr(~dz0), Fr(~bfd0) ]
+  --[ Published('e0', ~acc0, ~dz0, ~bfd0, sign(<'e0', ~acc0, ~dz0, ~bfd0>, ~skM)) ]->
+  [ !MgrKey(~skM), ManagerState('e0'),
+    CurrentUpdate('e0', ~acc0, ~dz0, ~bfd0, sign(<'e0', ~acc0, ~dz0, ~bfd0>, ~skM)),
+    !PublishedUpdate('e0', ~acc0, ~dz0, ~bfd0, sign(<'e0', ~acc0, ~dz0, ~bfd0>, ~skM)) ]
+
+// Hardcoded 'e0'→'e1'. No ManagerState('e1') produced (no epoch chain).
+rule EpochCommit:
+  [ ManagerState('e0'), CurrentUpdate('e0', acc, dz, bfd, sigOld), !MgrKey(skM),
+    Fr(~accN), Fr(~dzN), Fr(~bfdN) ]
+  --[ EpochCommit('e1', ~accN, ~dzN, ~bfdN, sign(<'e1', ~accN, ~dzN, ~bfdN>, skM)),
+      Published('e1', ~accN, ~dzN, ~bfdN, sign(<'e1', ~accN, ~dzN, ~bfdN>, skM)) ]->
+  [ !PublishedUpdate('e1', ~accN, ~dzN, ~bfdN, sign(<'e1', ~accN, ~dzN, ~bfdN>, skM)) ]
+
+// Hardcoded issuance at 'e0'. Produces !HonestDevice(~i) for ForwardUpdate.
+rule IssueDevice:
+  [ !PublishedUpdate('e0', acc, dz, bfd, sigM),
+    Fr(~i), Fr(~tag), Fr(~skI), Fr(~vc), Fr(~zi), Fr(~c1), Fr(~c2) ]
+  --[ Issue(~i, 'e0'), IssuedWitness(~i, ~zi, ~c1, ~c2) ]->
+  [ DeviceState(~i, 'e0'), !DeviceCred(~i, ~vc, pk(~skI)), !DeviceKey(~i, ~skI),
+    !DeviceWitness(~i, ~zi, ~c1, ~c2), !DeviceTag(~i, ~tag),
+    Status(~tag, 'active'), !FreshAt(~i, 'e0'), !HonestDevice(~i) ]
+
+// Loop-breaker for DeviceState('e0'), bounded to depth 1 by UniqueUpdateRequest.
+rule DevicePrepareRequest:
+  [ DeviceState(i, 'e0'), !DeviceCred(i, vc, pkI), !DeviceKey(i, skI),
+    !PublishedUpdate('e1', acc, dz, bfd, sigM) ]
+  --[ UpdateRequest(i, 'e1') ]->
+  [ DeviceState(i, 'e0'),
+    Out(<i, 'e1', vc, h(<vc, 'e1', acc>), sign(h(<vc, 'e1', acc>), skI),
+         h(<h(<vc, 'e1', acc>), sign(h(<vc, 'e1', acc>), skI)>)>) ]
+
+rule DLTReceiveRequest:
+  [ In(<i, e, vc, m, tok, reqid>) ]
+  --[ UpdateReqReceived(i, e, reqid) ]->
+  [ PendingReq(i, e, vc, m, tok, reqid) ]
+
+rule DirectUpdateAllow:
+  [ PendingReq(i, 'e1', vc, m, tok, reqid), !DeviceCred(i, vc, pkI), !DeviceTag(i, tag),
+    Status(tag, 'active'), !PublishedUpdate('e1', acc, dz, bfd, sigM) ]
+  --[ Eq(m, h(<vc, 'e1', acc>)), Eq(verify(tok, m, pkI), true),
+      ReqAccepted(reqid), UpdateServedByDLT(i, 'e1', dz, bfd, sigM) ]->
+  [ !SeenReq(reqid), NetUpdate('dlt', i, 'e1', acc, dz, bfd, sigM) ]
+
+// NOT a loop-breaker: input DeviceState('e0') → output DeviceState('e1').
+rule ApplyUpdate:
+  [ NetUpdate(src, i, 'e1', acc, dz, bfd, sigM), DeviceState(i, 'e0'),
+    !PublishedUpdate('e1', acc, dz, bfd, sigM) ]
+  --[ ReceivesUpdate(i, 'e1'), DeviceAtEpoch(i, 'e1') ]->
+  [ DeviceState(i, 'e1'), !FreshAt(i, 'e1'), !HasUpdate(i, 'e1', acc, dz, bfd, sigM) ]
+
+rule RevokeDevice:
+  [ !DeviceTag(i, tag), Status(tag, 'active') ]
+  --[ Revoke(i, tag) ]->
+  [ Status(tag, 'revoked'), !Revoked(tag) ]
+
+rule CompromiseDevice:
+  [ !DeviceKey(i, skI), !DeviceWitness(i, zi, c1, c2), !DeviceCred(i, vc, pkI) ]
+  --[ Compromise(i) ]->
+  [ !Compromised(i), Out(<skI, zi, c1, c2, vc>) ]
+
+// NOT a loop-breaker: reads !HonestDevice(to) (persistent) instead of DeviceState(to,'e0').
+// DeviceState(to,'e0') is untouched — available for ApplyUpdate to consume later.
+// Bounded to at most one per (to, epoch) by UniqueForwardTo.
+rule ForwardUpdate:
+  [ !Compromised(fwd), !HasUpdate(fwd, 'e1', acc, dz, bfd, sigM),
+    !HonestDevice(to) ]
+  --[ ForwardUpdate(fwd, to, 'e1') ]->
+  [ NetUpdate(fwd, to, 'e1', acc, dz, bfd, sigM) ]
+
+// ONE-SHOT: DeviceState consumed (not reproduced). No loop-breaker.
+rule InteractSuccess:
+  [ DeviceState(i, 'e1'), DeviceState(j, 'e1'), !FreshAt(i, 'e1'), !FreshAt(j, 'e1') ]
+  --[ DeviceInteract(i, j, 'e1') ]->
+  []
+
+/*
+  Witness: two honest devices both receive the epoch-1 update via DLT and interact.
+  No revocation or collusion involved.
+*/
+lemma completeness_witness:
+  exists-trace
+  "Ex i j acc dz bfd sig #ii #ij #ec #rq1 #rq2 #u1 #u2 #is.
+      Issue(i, 'e0')@#ii
+    & Issue(j, 'e0')@#ij
+    & EpochCommit('e1', acc, dz, bfd, sig)@#ec
+    & UpdateRequest(i, 'e1')@#rq1
+    & UpdateRequest(j, 'e1')@#rq2
+    & UpdateServedByDLT(i, 'e1', dz, bfd, sig)@#u1
+    & UpdateServedByDLT(j, 'e1', dz, bfd, sig)@#u2
+    & DeviceInteract(i, j, 'e1')@#is"
+
+/*
+  Witness: device i is revoked; device j is compromised; j forwards its
+  legitimately received update to i; i applies it and interacts with j at 'e1'.
+  Corresponds to collusion_bounded in attest_baseline.spthy with e='e1'=s('e0').
+*/
+lemma collusion_bounded_witness:
+  exists-trace
+  "Ex i j tag #r #cp #fw #ru #ju #is.
+      Revoke(i, tag)@#r
+    & Compromise(j)@#cp
+    & ForwardUpdate(j, i, 'e1')@#fw
+    & ReceivesUpdate(i, 'e1')@#ru
+    & ReceivesUpdate(j, 'e1')@#ju
+    & DeviceInteract(i, j, 'e1')@#is
+    & #cp < #fw
+    & #r < #fw
+    & #fw < #ru
+    & #ju < #is"
+
+end

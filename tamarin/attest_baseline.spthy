@@ -1,0 +1,1038 @@
+theory ATTEST_Baseline
+begin
+
+builtins: hashing, signing
+
+/*
+  s/1: an uninterpreted unary successor function with no equational theory.
+  Used to model epoch progression as Peano naturals: 'e0', s('e0'),
+  s(s('e0')), ... The term structure gives Tamarin a decidable ordering
+  without requiring arithmetic — s(x) ≠ x and s(x) ≠ s(y) when x ≠ y
+  follow directly from the free-algebra congruence rule.
+*/
+functions: s/1
+
+/*
+  heuristic: I — sets the global proof search strategy for all lemmas.
+  'I' is the injective stateful heuristic (manual p. 111) without
+  loop-breaker delay: it treats fact, action, and knowledge constraints
+  at equal priority resolved by age, and resolves loop-breaker facts
+  eagerly rather than deferring them. Both halves matter here:
+  - Injective: the model has the UniqueReqAccepted restriction (injectivity
+    on reqID), for which the i/I family is specifically designed.
+  - No loop-breaker delay (capital I over lowercase i): the remaining
+    necessary loops (DeviceState chains, relay Status) are loop-breakers
+    that must be resolved eagerly for [use_induction] lemmas to terminate.
+    Lowercase i would defer them, risking non-termination.
+*/
+heuristic: I
+
+/*
+  Symbolic baseline model for ATTEST (Sections 13-14 of the paper).
+
+  MODEL ABSTRACTION SOUNDNESS (justifying state simplifications, §14.3.1)
+  =========================================================================
+  The model uses four abstractions relative to the full protocol state.
+  Each is justified by a property already established in the symbolic model
+  or in the computational proofs, so no security is lost.
+
+  (Prop 1) Manager state reduction.
+    The full manager state (Z, L, BF, e) is replaced by the epoch counter e
+    alone. The manager's only security-relevant action is producing correctly
+    signed epoch update tuples. In EpochCommit, the update components
+    (~accN, ~dzN, ~bfdN) are globally fresh nonces: the Dolev-Yao adversary
+    cannot derive them because they never appear in any Out(·) fact except
+    as part of a manager signature. By EUF-CMA of the signing builtin —
+    verify(sign(m,sk), m, pk(sk)) = true is an equation but no rule
+    constructs sign(m,sk) without sk — any !PublishedUpdate in a reachable
+    state was necessarily produced by EpochCommit or Init. The internal
+    ring computation Z = Σ β_j z_j that produced acc is irrelevant to this
+    invariant; only the signature binding matters, and it is captured exactly.
+
+  (Prop 2) DLT as persistent fact set.
+    The DLT is modelled as the persistent multiset {!PublishedUpdate(...)}.
+    Tamarin's persistent facts (!F) are never consumed by any rule, directly
+    modelling append-only semantics. By Prop 1, only EpochCommit (requiring
+    !MgrKey) and Init produce !PublishedUpdate entries. BF-gated access is
+    captured by Status(tag,'active'/'revoked') checks in DirectUpdateAllow
+    and DirectUpdateDeny. No separate DLTState fact is needed.
+
+  (Prop 3) Relay BF state as shared ground truth.
+    In the real protocol, a relay's local BF copy may lag behind the DLT
+    by at most one fetch window. The model uses global Status(tag,·) facts
+    set immediately by RevokeDevice — a conservative abstraction that
+    over-denies relative to the real protocol. Every trace permitted by the
+    real protocol is permitted by the model, so safety properties proven
+    here transfer to the real protocol under Assumption A3. The model cannot
+    produce a spurious proof by being too permissive.
+
+  (Prop 4) Device state decomposition.
+    DeviceState(vc_i, w_i, Acc, e) is split into DeviceState(i,e),
+    !DeviceCred(i,vc,pk(skI)), !DeviceKey(i,skI), !DeviceWitness(i,zi,c1,c2).
+    This is a bijection on fact tuples: every rule produces and consumes the
+    split facts in exactly the combinations that the combined fact would.
+    No security content — purely structural, enabling finer-grained tracking
+    (e.g., CompromiseDevice leaks keys without consuming DeviceState).
+
+  SOURCE PRECOMPUTATION AND PARTIAL DECONSTRUCTIONS
+  ==================================================
+  Tamarin's refined-source precomputation traces every fact back to its
+  possible producer rules. If a fact appears in both the premiss and the
+  conclusion of a rule (a "loop-breaker"), Tamarin cannot fully resolve its
+  source and emits a partial deconstruction warning, causing case splits
+  that slow or prevent termination. We eliminate all avoidable loops:
+
+  - !DeviceCred, !DeviceKey, !DeviceWitness (persistent): device-lifetime
+    constants — credential pair (vc, pk_i), signing key sk_i, witness
+    transcript (z_i, c_1, c_2). None change after issuance. Making them
+    persistent removes reproduce loops in DevicePrepareRequest and
+    CompromiseDevice.
+
+  - !FreshAt (persistent): historical fact "device i received a genuine
+    manager-signed update at epoch e". Once true, remains true. Making it
+    persistent removes the reproduce loop in InteractSuccess.
+
+  - !DeviceTag (persistent): the BF tag is assigned at issuance/registration
+    and never changes — it is a permanent (device, tag) binding. Making it
+    persistent removes loops in RevokeDevice, RelayFetchIfActive,
+    RelayForwardAllow, RelayServeCumulative, and all direct-update rules.
+    Previously !DeviceTag was linear, creating loop-breakers at every rule
+    that used both the device's BF status and its identity.
+
+  - RelayState eliminated: RelayState(r, er) tracked the relay's "current
+    epoch" but this value was never constrained relative to the new epoch e
+    fetched from !PublishedUpdate (no er < e check). The relay's relevant
+    state is fully captured by !HonestRelay (registered identity) and the
+    set of !RelayHas facts accumulated. Removing RelayState eliminates its
+    loop-breaker in RelayFetchIfActive and the RelayState/2 entry in the
+    looping-fact list.
+
+  - CurrentUpdate removed from RegisterRelay, IssueDevice, DevicePrepareRequest:
+    these three rules previously consumed and reproduced CurrentUpdate
+    unchanged, creating three loop-breaker sources. They only need to read
+    a valid published epoch; !PublishedUpdate suffices. CurrentUpdate remains
+    linear and is only touched by Init and EpochCommit, giving it exactly
+    one non-looping producer chain: Init → EpochCommit (advance) → ...
+
+  Remaining necessary loops (accepted):
+  - DeviceState(i,e): reproduced by DevicePrepareRequest, ForwardUpdate,
+    InteractSuccess; advanced by ApplyUpdate/ApplyCumulativeUpdate. Models
+    device epoch progression and cannot be eliminated. Handled by
+    [use_induction] on revocation_enforcement and epoch_exclusion, and by
+    heuristic I (no loop-breaker delay).
+  - Status(tagR,'active') in relay rules: Status is fundamentally mutable
+    (active → revoked transition is irreversible via RevokeDevice, which
+    cannot be undone). Relay rules must check and reproduce Status(tagR,'active')
+    for liveness — a revoked relay should be blocked, and this check must
+    fire on every relay operation. Handled by heuristic I.
+*/
+
+/*
+  Equality restriction: standard Tamarin pattern for enforcing term equality
+  inside rule actions. Used in DirectUpdateAllow, RelayForwardAllow, and
+  RelayServeCumulative to check that the received message hash m equals
+  h(vc, e, acc) and that the token signature verifies against pk_i. Encoding
+  these as Eq actions (rather than built-in matching) allows the checks to
+  appear in the action trace for proof inspection.
+*/
+restriction Equality:
+  "All x y #i. Eq(x,y)@#i ==> x = y"
+
+/*
+  Replay prevention (§13.3, Eq. update-token). Each request identifier
+  reqID = H(m || token) is accepted by at most one DirectUpdateAllow or
+  RelayForwardAllow rule instance in the entire trace. DirectUpdateReplay
+  discards duplicates before they reach the update-serving rules.
+  This models the DLT's per-epoch processed-request-ID set (§13.3), which
+  blocks within-epoch replay of a previously accepted update request.
+*/
+restriction UniqueReqAccepted:
+  "All rid #i #j. ReqAccepted(rid)@#i & ReqAccepted(rid)@#j ==> #i = #j"
+
+/*
+  Manager initialisation. Generates the manager signing key skM and the
+  initial epoch-0 update material (acc0, dz0, bfd0) as fresh nonces.
+
+  Abstraction soundness (Prop 1): acc0, dz0, bfd0 abstract the real initial
+  accumulator digest Acc, zero delta ΔZ = 0, and empty status-filter delta
+  BF_Δ = 0 respectively. Using globally fresh nonces is sound because the
+  Dolev-Yao adversary cannot derive them (they appear only inside the signed
+  tuple, never in a bare Out fact). By EUF-CMA of the signing builtin,
+  sign(<e0, acc0, dz0, bfd0>, skM) can be verified only with pk(skM); the
+  adversary who does not hold skM cannot produce a valid signature for any
+  other tuple. !MgrKey(skM) is persistent and never output to the network,
+  so skM remains manager-private for the entire trace.
+
+  Published action: Init emits Published('e0',...) so that no_selective_omission
+  can uniformly say "the update was Published by the manager" — covering both
+  the epoch-0 case (Init) and all subsequent epochs (EpochCommit). Without this,
+  no_selective_omission would be falsified: a relay can serve epoch-0 updates
+  (from !PublishedUpdate produced by Init) yet no EpochCommit('e0',...) action
+  exists. Published unifies the two manager actions at a single abstraction level.
+*/
+rule Init:
+  [ Fr(~skM), Fr(~acc0), Fr(~dz0), Fr(~bfd0) ]
+  --[ Published('e0', ~acc0, ~dz0, ~bfd0, sign(<'e0', ~acc0, ~dz0, ~bfd0>, ~skM)) ]->
+  [ !MgrKey(~skM),
+    ManagerState('e0'),
+    CurrentUpdate('e0', ~acc0, ~dz0, ~bfd0, sign(<'e0', ~acc0, ~dz0, ~bfd0>, ~skM)),
+    !PublishedUpdate('e0', ~acc0, ~dz0, ~bfd0, sign(<'e0', ~acc0, ~dz0, ~bfd0>, ~skM)) ]
+
+/*
+  Relay registration. A new relay r is issued a fresh identity ~r and a
+  fresh BF tag ~tagR, initialised as 'active'. !HonestRelay(~r) marks r as
+  an eligible relay for RelayFetchIfActive, RelayForwardAllow, and
+  RelayServeCumulative.
+
+  !DeviceTag(~r, ~tagR) is persistent: the (relay, tag) binding is permanent
+  and never changes after registration. This removes DeviceTag from the
+  loop-breaker set (source precomputation note above).
+
+  RelayState has been eliminated: it tracked the relay's "current epoch" but
+  imposed no constraint (no er < e ordering). The relay's identity is
+  fully captured by !HonestRelay(~r), and its update history by the set
+  of !RelayHas facts it accumulates via RelayFetchIfActive.
+
+  Uses !PublishedUpdate instead of CurrentUpdate: the relay needs to know
+  a valid epoch at registration time, and any published epoch suffices.
+  RelayRegistered(~r, e) records which epoch the relay joined.
+
+  The relay's status tag models the BF membership check applied to the relay
+  itself when it fetches from the DLT: if the relay is subsequently revoked
+  (RevokeDevice fires for r), Status(~tagR,'active') is permanently consumed
+  and Status(~tagR,'revoked') takes its place. RelayFetchIfActive and
+  RelayForwardAllow then cannot fire for r, cutting off the relay's ability
+  to serve updates — consistent with §13.2.
+*/
+rule RegisterRelay:
+  [ !PublishedUpdate(e, acc, dz, bfd, sigM), Fr(~r), Fr(~tagR) ]
+  --[ RelayRegistered(~r, e) ]->
+  [ !DeviceTag(~r, ~tagR),
+    Status(~tagR, 'active'),
+    !HonestRelay(~r) ]
+
+/*
+  Credential issuance (ATTEST.Issue, Algorithm 1, §13.3). Issues device i
+  with fresh identity ~i, credential ~vc, long-term signing key ~skI,
+  witness components (~zi, ~c1, ~c2), and BF tag ~tag.
+
+  Uses !PublishedUpdate instead of CurrentUpdate (see source precomputation
+  note): issuance at any published epoch is valid, removing a loop-breaker.
+
+  Abstraction soundness (Prop 4) + source precomputation:
+  - !DeviceCred(~i, ~vc, pk(~skI)): persistent — the credential pair (vc, pk_i)
+    is a device-lifetime constant.
+  - !DeviceKey(~i, ~skI): persistent — sk_i is a device-lifetime constant.
+    sk_i enters adversary knowledge only via Out(...) in CompromiseDevice,
+    so secrecy is unaffected.
+  - !DeviceWitness(~i, ~zi, ~c1, ~c2): persistent — z_i, c_1, c_2 are
+    immutable transcript components (WitUpdate only changes Z_i, not these).
+  - !DeviceTag(~i, ~tag): persistent — the BF tag is permanent. The (device,
+    tag) binding does not change after issuance. Removing the DeviceTag loop
+    eliminates loop-breakers in RevokeDevice, DirectUpdateAllow, DirectUpdateDeny,
+    RelayForwardAllow, and RelayServeCumulative.
+  - !FreshAt(~i, e): persistent — a historical freshness record. Once device
+    i has a genuine update at epoch e, that fact does not expire. Eliminates
+    the loop in InteractSuccess.
+
+  IssuedWitness(~i, ~zi, ~c1, ~c2) records the witness binding for secrecy.
+*/
+rule IssueDevice:
+  [ !PublishedUpdate(e, acc, dz, bfd, sigM),
+    Fr(~i), Fr(~tag), Fr(~skI), Fr(~vc), Fr(~zi), Fr(~c1), Fr(~c2) ]
+  --[ Issue(~i, e), IssuedWitness(~i, ~zi, ~c1, ~c2) ]->
+  [ DeviceState(~i, e),
+    !DeviceCred(~i, ~vc, pk(~skI)),
+    !DeviceKey(~i, ~skI),
+    !DeviceWitness(~i, ~zi, ~c1, ~c2),
+    !DeviceTag(~i, ~tag),
+    Status(~tag, 'active'),
+    !FreshAt(~i, e),
+    !HonestDevice(~i) ]
+
+/*
+  Epoch advance (EpochUpdate, Algorithm 2, §13.3). Increments the epoch
+  from e to s(e) and commits fresh update material (~accN, ~dzN, ~bfdN)
+  to the DLT as a manager-signed tuple.
+
+  CurrentUpdate is linear and only appears here (advance) and in Init
+  (initial production). After removing it from RegisterRelay, IssueDevice,
+  and DevicePrepareRequest, CurrentUpdate has exactly one non-looping
+  producer chain: Init → EpochCommit (advance) → EpochCommit → ...
+  This eliminates all partial deconstruction warnings on CurrentUpdate.
+
+  Abstraction soundness (Prop 1 + Prop 2):
+  - ~accN, ~dzN, ~bfdN are fresh nonces abstracting (Acc*, ΔZ, BF_Δ). By
+    EUF-CMA, the signature sign(<s(e), ~accN, ~dzN, ~bfdN>, skM) can only
+    be produced here. The adversary has no rule that outputs skM, so it
+    cannot fabricate epoch updates or equivocate on their content.
+  - !PublishedUpdate is persistent: append-only semantics (Prop 2).
+  - CurrentUpdate is linear: exactly one epoch's update is "current" at
+    any time, enforcing the sequential structure e0 → s(e0) → ...
+*/
+rule EpochCommit:
+  [ ManagerState(e),
+    CurrentUpdate(e, acc, dz, bfd, sigOld),
+    !MgrKey(skM),
+    Fr(~accN), Fr(~dzN), Fr(~bfdN) ]
+  --[ EpochCommit(s(e), ~accN, ~dzN, ~bfdN, sign(<s(e), ~accN, ~dzN, ~bfdN>, skM)),
+      Published(s(e), ~accN, ~dzN, ~bfdN, sign(<s(e), ~accN, ~dzN, ~bfdN>, skM)) ]->
+  [ ManagerState(s(e)),
+    CurrentUpdate(s(e), ~accN, ~dzN, ~bfdN, sign(<s(e), ~accN, ~dzN, ~bfdN>, skM)),
+    !PublishedUpdate(s(e), ~accN, ~dzN, ~bfdN, sign(<s(e), ~accN, ~dzN, ~bfdN>, skM)) ]
+
+/*
+  Revocation (§13.3, BF.Insert step of EpochUpdate Phase B). Permanently
+  transitions Status(tag,'active') → Status(tag,'revoked') for the device
+  or relay holding tag. !Revoked(tag) is additionally recorded as a
+  persistent fact for use in update_gatekeeping proofs.
+
+  !DeviceTag(i,tag) is now persistent: the rule reads the permanent
+  (entity, tag) mapping without consuming it. This removes the DeviceTag
+  loop-breaker that RevokeDevice previously had. The transition is
+  irreversible: no rule produces Status(tag,'active') once
+  Status(tag,'revoked') is in the state.
+
+  This models BF.Insert(BF, H_tag(vc_i)) in the real protocol. Captures:
+  (a) BF zero-false-negative (Property BF-ZFN) — a revoked tag always tests
+  positive, so the BF gate always fires; and (b) BF monotonicity — BF.Merge
+  only sets bits (OR operation), so once a tag is in BF it remains there
+  across all subsequent epochs.
+*/
+rule RevokeDevice:
+  [ !DeviceTag(i, tag), Status(tag, 'active') ]
+  --[ Revoke(i, tag) ]->
+  [ Status(tag, 'revoked'), !Revoked(tag) ]
+
+/*
+  Update request token generation (§13.3, Eq. update-token). Device i
+  computes m = H(vc, e, Acc) and token = Sig_{sk_i}(m), then broadcasts
+  the tuple (i, e, vc, m, token, reqID) to the network.
+
+  Uses !PublishedUpdate instead of CurrentUpdate (source precomputation):
+  the device can request an update for any published epoch, which is correct
+  — in the real protocol the device uses the latest epoch it knows about.
+
+  !DeviceCred and !DeviceKey are persistent (no reproduce needed).
+  DeviceState(i, eI) is reproduced: this is a necessary loop-breaker
+  (the only remaining one for device identity) that cannot be eliminated
+  without losing the device lifecycle structure. The [use_induction] on
+  revocation_enforcement and epoch_exclusion handles the backward search
+  on DeviceState chains.
+
+  Binding m to (vc, e, acc) prevents cross-epoch replay; reqID additionally
+  binds (m, token), blocked by UniqueReqAccepted within an epoch.
+*/
+rule DevicePrepareRequest:
+  [ DeviceState(i, eI),
+    !DeviceCred(i, vc, pkI),
+    !DeviceKey(i, skI),
+    !PublishedUpdate(e, acc, dz, bfd, sigM) ]
+  --[ UpdateRequest(i, e) ]->
+  [ DeviceState(i, eI),
+    Out(<i, e, vc, h(<vc, e, acc>), sign(h(<vc, e, acc>), skI), h(<h(<vc, e, acc>), sign(h(<vc, e, acc>), skI)>)>) ]
+
+/*
+  DLT ingestion of a network message as a pending update request. Accepts
+  any well-typed message from the Dolev-Yao network without authentication
+  at this stage. Authentication is deferred to DirectUpdateAllow, which
+  verifies the token signature and checks m = H(vc, e, acc) via the Equality
+  restriction. This separation models the DLT's stateless receipt of messages
+  before the BF-gated processing step; the adversary may inject, replay, or
+  modify messages between DevicePrepareRequest and this rule.
+*/
+rule DLTReceiveRequest:
+  [ In(<i, e, vc, m, tok, reqid>) ]
+  --[ UpdateReqReceived(i, e, reqid) ]->
+  [ PendingReq(i, e, vc, m, tok, reqid) ]
+
+/*
+  Relay fetches an epoch update from the DLT (§13.3, Update Distribution,
+  indirect update path). The relay r checks its own BF status before
+  fetching: Status(tagR,'active') is required. A revoked relay cannot fetch.
+
+  RelayState has been eliminated (see top comment). !HonestRelay(r) serves
+  as the relay identity gate (persistent, no loop). !DeviceTag(r,tagR) is
+  persistent (no consume/reproduce needed), eliminating the DeviceTag loop.
+
+  Status(tagR,'active') remains linear and is reproduced: this is the one
+  necessary loop-breaker for the relay lifecycle. It must remain mutable
+  (RevokeDevice transitions it irreversibly to 'revoked'). Heuristic I
+  (no loop-breaker delay) resolves this eagerly.
+
+  !RelayHas: relay-specific per-epoch cache, used by RelayForwardAllow/Deny.
+  !HasUpdate: also produced here so a compromised relay can forward (collusion).
+*/
+rule RelayFetchIfActive:
+  [ !HonestRelay(r),
+    !DeviceTag(r, tagR),
+    Status(tagR, 'active'),
+    !PublishedUpdate(e, acc, dz, bfd, sigM) ]
+  --[ RelayFetched(r, e) ]->
+  [ Status(tagR, 'active'),
+    !RelayHas(r, e, acc, dz, bfd, sigM),
+    !HasUpdate(r, e, acc, dz, bfd, sigM) ]
+
+/*
+  DLT serves an epoch update to device i (direct path, §13.3). Enforces
+  three checks before serving update material:
+  (1) m = H(vc, e, acc) via Equality — binds the request to the correct
+      (credential, epoch, accumulator) triple; prevents cross-epoch replay.
+  (2) verify(tok, m, pk_i) = true via Equality — authenticates device i as
+      the holder of credential vc; modelled by EUF-CMA of the signing builtin.
+  (3) Status(tag,'active') — BF gate: H_tag(vc_i) ∉ BF, i.e., not revoked.
+      This is the formal encoding of Assumption B (§14.2).
+
+  !DeviceCred is persistent (no reproduce). !DeviceTag is persistent (no
+  reproduce). Status(tag,'active') is consumed (not reproduced): one-shot
+  per tag, conservative for safety — the critical direction is that
+  Status('revoked') blocks this rule permanently via RevokeDevice.
+
+  Abstraction soundness (Prop 2): the DLT's BF-gated query interface is
+  captured entirely by the Status(tag,'active') premiss.
+*/
+rule DirectUpdateAllow:
+  [ PendingReq(i, e, vc, m, tok, reqid),
+    !DeviceCred(i, vc, pkI),
+    !DeviceTag(i, tag),
+    Status(tag, 'active'),
+    !PublishedUpdate(e, acc, dz, bfd, sigM) ]
+  --[ Eq(m, h(<vc, e, acc>)),
+      Eq(verify(tok, m, pkI), true),
+      ReqAccepted(reqid),
+      UpdateServedByDLT(i, e, dz, bfd, sigM) ]->
+  [ !SeenReq(reqid),
+    NetUpdate('dlt', i, e, acc, dz, bfd, sigM) ]
+
+/*
+  Replay rejection at DLT. If reqID was already accepted (!SeenReq(reqid)),
+  a duplicate PendingReq is silently discarded without serving any update
+  material. Together with UniqueReqAccepted this models the DLT's
+  per-epoch processed-request-ID set (§13.3), ensuring that a single valid
+  token cannot be replayed to obtain the update more than once.
+*/
+rule DirectUpdateReplay:
+  [ PendingReq(i, e, vc, m, tok, reqid), !SeenReq(reqid) ]
+  --[ ReplayRejected(reqid) ]->
+  [ ]
+
+/*
+  DLT denies epoch update to revoked device i. Status(tag,'revoked') is
+  the BF-positive case (H_tag(vc_i) ∈ BF), so the DLT returns ⊥ and
+  emits UpdateDeniedByDLT. No update material reaches the network. This
+  rule fires in place of DirectUpdateAllow when the device is revoked;
+  the mutual exclusion between Status('active') and Status('revoked') as
+  linear facts ensures exactly one path fires for a given tag.
+
+  !DeviceTag is persistent (no reproduce needed).
+*/
+rule DirectUpdateDeny:
+  [ PendingReq(i, e, vc, m, tok, reqid),
+    !DeviceTag(i, tag),
+    Status(tag, 'revoked'),
+    !PublishedUpdate(e, acc, dz, bfd, sigM) ]
+  --[ UpdateDeniedByDLT(i, e) ]->
+  [ ]
+
+/*
+  Relay forwards an epoch update to device i (indirect path, §13.3).
+  Performs the same three checks as DirectUpdateAllow (message hash,
+  token signature, requesting device BF gate) and additionally checks
+  that the relay itself is not revoked (Status(tagR,'active')).
+
+  !DeviceCred is persistent. !DeviceTag(i,tag) and !DeviceTag(r,tagR) are
+  both persistent — no consume/reproduce needed for either, eliminating
+  two DeviceTag loop-breakers previously present in this rule.
+
+  Status(tagR,'active') is reproduced: necessary loop-breaker for relay
+  liveness (see RelayFetchIfActive comment). Heuristic I handles this.
+  Status(tag,'active') for the requesting device is consumed (not reproduced):
+  same one-shot semantics as DirectUpdateAllow.
+
+  Abstraction soundness (Prop 3): using the global Status(tagR,'active')
+  as the relay's BF state is conservative — the model over-denies in the
+  relay staleness window, so safety proofs transfer to the real protocol.
+*/
+rule RelayForwardAllow:
+  [ PendingReq(i, e, vc, m, tok, reqid),
+    !DeviceCred(i, vc, pkI),
+    !DeviceTag(i, tag),
+    Status(tag, 'active'),
+    !HonestRelay(r),
+    !DeviceTag(r, tagR),
+    Status(tagR, 'active'),
+    !RelayHas(r, e, acc, dz, bfd, sigM) ]
+  --[ Eq(m, h(<vc, e, acc>)),
+      Eq(verify(tok, m, pkI), true),
+      ReqAccepted(reqid),
+      UpdateServedByRelay(r, i, e, dz, bfd, sigM) ]->
+  [ !SeenReq(reqid),
+    NetUpdate(r, i, e, acc, dz, bfd, sigM),
+    Status(tagR, 'active') ]
+
+/*
+  Relay denies epoch update to revoked device i. Status(tag,'revoked') on
+  the requesting device triggers denial; the relay's own !RelayHas is
+  read (persistent, no reproduce needed) since the relay's state is unaffected
+  by the requester's revocation. !DeviceTag(i,tag) is persistent.
+  UpdateDeniedByRelay is the action traced in the attack-surface discussion
+  and provides the relay-path dual to UpdateDeniedByDLT.
+*/
+rule RelayForwardDeny:
+  [ PendingReq(i, e, vc, m, tok, reqid),
+    !HonestRelay(r),
+    !RelayHas(r, e, acc, dz, bfd, sigM),
+    !DeviceTag(i, tag),
+    Status(tag, 'revoked') ]
+  --[ UpdateDeniedByRelay(r, i, e) ]->
+  [ ]
+
+/*
+  Device applies a received epoch update (WitUpdate, Algorithm 3, §13.3).
+  Consumes DeviceState(i, eI) at the old epoch and produces DeviceState(i, e)
+  at the new epoch. The signature check is enforced structurally: NetUpdate
+  is produced only by DirectUpdateAllow or RelayForwardAllow (both require
+  !PublishedUpdate, which carries the authentic manager signature) or by
+  ForwardUpdate (the collusion path).
+
+  !FreshAt(i,e) is persistent: the historical fact "device i received
+  a genuine update at epoch e" does not expire. Eliminates the reproduce
+  loop that InteractSuccess previously had on FreshAt.
+
+  DeviceAtEpoch(i,e) is emitted for epoch_exclusion. !HasUpdate(i,e,...)
+  enables ForwardUpdate (collusion): a compromised device that legitimately
+  received an update can forward it.
+
+  NOTE: DeviceState(i,e) is a looping linear fact (ADVANCE pattern).
+  ApplyUpdate consumes DeviceState(i,eI) and produces DeviceState(i,e);
+  backward search on DeviceState chains without an inductive hypothesis
+  loops indefinitely. This is why revocation_enforcement and epoch_exclusion
+  carry [use_induction].
+*/
+rule ApplyUpdate:
+  [ NetUpdate(src, i, e, acc, dz, bfd, sigM),
+    DeviceState(i, eI),
+    !PublishedUpdate(e, acc, dz, bfd, sigM) ]
+  --[ ReceivesUpdate(i, e), DeviceAtEpoch(i, e) ]->
+  [ DeviceState(i, e),
+    !FreshAt(i, e),
+    !HasUpdate(i, e, acc, dz, bfd, sigM) ]
+
+/*
+  Constructs a cumulative update spanning two published epochs (§13.3,
+  catch-up paragraph). In the real protocol ΔZ_cum = ΔZ_{e1} + ΔZ_{e2}
+  and BF_{Δ,cum} = BF_{Δ,e1} OR BF_{Δ,e2}. The model abstracts the
+  algebraic sum as the pair <dz1, dz2> and the OR as <bfd1, bfd2>, which
+  is sufficient for catch_up_correctness: that lemma only requires that a
+  CumulativeBuilt event precedes ReceivesCumulative, not that the sum is
+  computed correctly. Two epochs is the minimal non-trivial case; the
+  structural property generalises by induction on the number of epochs.
+  Both source facts are persistent, so the cumulative update is stable once
+  built and cannot be invalidated by subsequent state changes.
+*/
+rule BuildCumulativeFromTwo:
+  [ !PublishedUpdate(e1, acc1, dz1, bfd1, sig1),
+    !PublishedUpdate(e2, acc2, dz2, bfd2, sig2) ]
+  --[ CumulativeBuilt(e1, e2, <dz1, dz2>, <bfd1, bfd2>) ]->
+  [ !CumulativeUpdate(e2, acc2, <dz1, dz2>, <bfd1, bfd2>) ]
+
+/*
+  Relay serves a cumulative catch-up update (§13.3, offline catch-up path).
+  Enforces the same three checks as RelayForwardAllow: message hash, token
+  signature, and requesting device BF gate. Also enforces the relay's own
+  BF gate (Status(tagR,'active')), consistent with RelayForwardAllow.
+
+  !DeviceCred, !DeviceTag(i,tag), and !DeviceTag(r,tagR) are all persistent
+  (no reproduce). Status(tagR,'active') is reproduced: same necessary
+  relay liveness loop-breaker as RelayForwardAllow. Status(tag,'active')
+  for device i is consumed (one-shot, same semantics as DirectUpdateAllow).
+*/
+rule RelayServeCumulative:
+  [ PendingReq(i, e, vc, m, tok, reqid),
+    !DeviceCred(i, vc, pkI),
+    !DeviceTag(i, tag),
+    Status(tag, 'active'),
+    !HonestRelay(r),
+    !DeviceTag(r, tagR),
+    Status(tagR, 'active'),
+    !CumulativeUpdate(e, acc, dCum, bCum) ]
+  --[ Eq(m, h(<vc, e, acc>)),
+      Eq(verify(tok, m, pkI), true),
+      ReqAccepted(reqid),
+      CumulativeServedByRelay(r, i, e) ]->
+  [ !SeenReq(reqid),
+    NetCumulative(r, i, e, acc, dCum, bCum),
+    Status(tagR, 'active') ]
+
+/*
+  Device applies a cumulative epoch update (§13.3, WitUpdate catch-up).
+  Analogous to ApplyUpdate but for the relay-mediated catch-up path.
+  !FreshAt(i,e) is persistent (no reproduce needed). Does not produce
+  !HasUpdate: cumulative updates are relay-assembled, not forwarded further.
+  ReceivesCumulative(i, e2) is the action traced in catch_up_correctness.
+*/
+rule ApplyCumulativeUpdate:
+  [ NetCumulative(src, i, e, acc, dCum, bCum),
+    DeviceState(i, eI),
+    !CumulativeUpdate(e, acc, dCum, bCum) ]
+  --[ ReceivesCumulative(i, e), DeviceAtEpoch(i, e) ]->
+  [ DeviceState(i, e),
+    !FreshAt(i, e) ]
+
+/*
+  Device compromise (Dolev-Yao adversary model, §14.1 threat model).
+  Leaks the full device credential state: signing key skI, witness
+  components (zi, c1, c2), and credential vc to the adversary via Out.
+
+  !DeviceCred, !DeviceKey, !DeviceWitness are all persistent: they do not
+  need to be reproduced in the conclusion (they persist automatically).
+  This eliminates all three reproduce loops that CompromiseDevice previously
+  had — the largest single source of loop-breakers in the original model.
+
+  !Compromised(i) records the event persistently, enabling ForwardUpdate.
+  Semantics unchanged: the adversary learns (skI, zi, c1, c2, vc) only
+  via Out, not by direct store access. Witness secrecy holds because
+  K(<zi,c1,c2>) can only come from this Out fact (zi, c1, c2 are fresh
+  nonces not derivable from any public term).
+*/
+rule CompromiseDevice:
+  [ !DeviceKey(i, skI), !DeviceWitness(i, zi, c1, c2), !DeviceCred(i, vc, pkI) ]
+  --[ Compromise(i) ]->
+  [ !Compromised(i),
+    Out(<skI, zi, c1, c2, vc>) ]
+
+/*
+  Collusion: a compromised device fwd forwards a cached epoch update to
+  any target device to (§14, Remark collusion). !Compromised(fwd) ensures
+  only previously compromised devices can forward. !HasUpdate(fwd,e,...)
+  is the update material cached from DirectUpdateAllow, RelayForwardAllow,
+  or RelayFetchIfActive (legitimate receipt). DeviceState(to, eT) is
+  reproduced: a necessary loop-breaker for the target device's lifecycle
+  (the forward does not advance to's epoch — that happens in ApplyUpdate).
+
+  ForwardUpdate(fwd, to, e) is the action traced by revocation_enforcement
+  and epoch_exclusion as the only permissible explanation for a revoked
+  device acquiring a fresh witness.
+*/
+rule ForwardUpdate:
+  [ !Compromised(fwd),
+    !HasUpdate(fwd, e, acc, dz, bfd, sigM),
+    DeviceState(to, eT) ]
+  --[ ForwardUpdate(fwd, to, e) ]->
+  [ DeviceState(to, eT),
+    NetUpdate(fwd, to, e, acc, dz, bfd, sigM) ]
+
+/*
+  Peer authentication (§13.3, Authentication, steps 2-3). Two devices i
+  and j interact at epoch e. Required preconditions:
+  - DeviceState(i,e) and DeviceState(j,e): same epoch (step 2 — epoch sync).
+  - !FreshAt(i,e) and !FreshAt(j,e): both have genuine update at epoch e.
+    Now persistent: no reproduce needed, eliminating the FreshAt loop.
+
+  DeviceState(i,e) and DeviceState(j,e) are still reproduced: necessary
+  loop-breakers (device remains in the system after interacting). These
+  are the only remaining reproduce loops in InteractSuccess.
+
+  DeviceInteract(i,j,e) is the action traced in revocation_enforcement,
+  epoch_exclusion, collusion_bounded, and completeness.
+*/
+rule InteractSuccess:
+  [ DeviceState(i, e), DeviceState(j, e), !FreshAt(i, e), !FreshAt(j, e) ]
+  --[ DeviceInteract(i, j, e) ]->
+  [ DeviceState(i, e), DeviceState(j, e) ]
+
+/*
+  Safety lemma (DLT path): the DLT never serves an epoch update to device i
+  after i is revoked (formal proof of Assumption B for the DLT, §14.2).
+
+  Proof: DirectUpdateAllow requires Status(tag,'active') as a linear premiss.
+  RevokeDevice requires the same fact and transitions it irreversibly to
+  Status(tag,'revoked'). Since both rules consume this single linear token,
+  they are mutually exclusive in any trace prefix: either Revoke(i,tag) fires
+  (consuming 'active', producing 'revoked') or DirectUpdateAllow fires
+  (consuming 'active'). If Revoke fires first, 'active' is gone and
+  DirectUpdateAllow can never fire for tag. The linking fact !DeviceTag(i,tag)
+  is now persistent and not a loop-breaker; Tamarin closes the argument by
+  case-splitting on the unique Status token in the multiset state.
+
+  [reuse]: used as a sub-goal in revocation_enforcement and epoch_exclusion
+  to exclude the DLT path when those lemmas must account for the source of
+  !FreshAt(i,e) after revocation.
+*/
+lemma update_gatekeeping_dlt [reuse]:
+  "All i tag e dz bfd sig #r #s.
+      Revoke(i, tag)@#r
+    & UpdateServedByDLT(i, e, dz, bfd, sig)@#s
+    & #r < #s
+    ==> F"
+
+/*
+  Safety lemma (relay path): an honest relay never forwards an epoch update
+  to device i after i is revoked (formal proof of Assumption B for relays).
+
+  Proof: identical mutual-exclusion argument to update_gatekeeping_dlt but
+  for RelayForwardAllow, which also requires Status(tag,'active') for the
+  requesting device. After RevokeDevice transitions tag to 'revoked', the
+  Status('active') token is absent, so RelayForwardAllow cannot fire.
+  The relay's own Status(tagR,'active') is independent and irrelevant to
+  this argument (it concerns a different tag). !DeviceTag(i,tag) is
+  persistent and not a loop-breaker.
+
+  [reuse]: dual to update_gatekeeping_dlt; used in the same downstream lemmas
+  to exclude the relay path.
+*/
+lemma update_gatekeeping_relay [reuse]:
+  "All r i tag e dz bfd sig #rv #s.
+      Revoke(i, tag)@#rv
+    & UpdateServedByRelay(r, i, e, dz, bfd, sig)@#s
+    & #rv < #s
+    ==> F"
+
+/*
+  Combined safety lemma for paper Table 2 (update_gatekeeping). Conjoins
+  the DLT and relay sub-lemmas as the single statement cited in Theorem
+  revocation_soundness (§14.3, part i). This is the Tamarin-verified proof
+  of Assumption B (§14.2): every honest update source enforces the BF gate.
+  The proof follows by [reuse] of update_gatekeeping_dlt and
+  update_gatekeeping_relay; no additional proof work is needed here.
+*/
+lemma update_gatekeeping:
+  "(All i tag e dz bfd sig #r #s.
+      Revoke(i, tag)@#r
+    & UpdateServedByDLT(i, e, dz, bfd, sig)@#s
+    & #r < #s
+    ==> F)
+   &
+   (All r i tag e dz bfd sig #rv #s.
+      Revoke(i, tag)@#rv
+    & UpdateServedByRelay(r, i, e, dz, bfd, sig)@#s
+    & #rv < #s
+    ==> F)"
+
+/*
+  Helper lemma: every RelayFetched(r,e) action was preceded by a Published
+  event for the same epoch e. This closes the !RelayHas -> !PublishedUpdate
+  chain without requiring the caller to traverse the Status(tagR,'active')
+  loop in RelayFetchIfActive's premiss.
+
+  Proof (acyclic over persistent facts):
+    RelayFetched(r,e) (from RelayFetchIfActive)
+      <- !PublishedUpdate(e, acc, dz, bfd, sig) (from EpochCommit or Init)
+        <- Published(e,...) action (emitted by EpochCommit and Init)
+  !PublishedUpdate and !RelayHas are persistent; no DeviceState or Status
+  in this chain. No [use_induction] needed.
+
+  [reuse]: used by no_selective_omission to avoid re-traversing the chain.
+*/
+lemma relay_fetch_implies_published [reuse]:
+  "All r e #f.
+      RelayFetched(r, e)@#f
+    ==> Ex acc dz bfd sig #p. Published(e, acc, dz, bfd, sig)@#p & #p < #f"
+
+/*
+  Safety lemma: every relay-served update corresponds to a genuine manager-
+  published epoch (§14.3.2, no selective omission). If a relay serves
+  (dz, bfd, sig) to device i at epoch e, then a Published(e,...) event
+  (emitted by Init for e='e0' or by EpochCommit for later epochs) occurred
+  before, with the same (dz, bfd, sig).
+
+  Uses Published instead of EpochCommit: Init produces !PublishedUpdate('e0',...)
+  directly without firing an EpochCommit action. If the lemma used EpochCommit,
+  it would be falsified by traces where the relay serves an epoch-0 update.
+  Published is emitted by both Init and EpochCommit, providing a uniform
+  anchor for manager authority.
+
+  Proof: relay_fetch_implies_published [reuse] closes the chain:
+    UpdateServedByRelay (from RelayForwardAllow)
+      <- !RelayHas(r, e, ...) (from RelayFetchIfActive, emitting RelayFetched)
+        <- Published(e,...) via relay_fetch_implies_published
+  The sig variable is the same throughout (sig = sign(<e,acc,dz,bfd>,skM)),
+  binding all four update components atomically. This prevents a relay from
+  stripping BF_delta (bfd) while forwarding only DeltaZ (dz).
+
+  [use_induction]: RelayForwardAllow's premiss contains Status(tagR,'active'),
+  which is a looping linear fact (reproduced by RelayFetchIfActive, RelayForwardAllow,
+  RelayServeCumulative). Backward search on Status(tagR,'active') recurses
+  indefinitely without an inductive hypothesis. With [use_induction], Tamarin
+  uses the inductive hypothesis for any earlier UpdateServedByRelay in the
+  backward trace, breaking the Status chain. relay_fetch_implies_published
+  [reuse] handles the Published sub-goal, so the overall proof is guided
+  to terminate.
+
+  [reuse]: referenced by epoch_exclusion and completeness to confirm relay
+  updates are authentic.
+*/
+lemma no_selective_omission [use_induction, reuse]:
+  "All r i e dz bfd sig #s.
+      UpdateServedByRelay(r, i, e, dz, bfd, sig)@#s
+    ==> Ex acc #c. Published(e, acc, dz, bfd, sig)@#c & #c < #s"
+
+/*
+  Mutual-exclusion helper (DLT path, no timing constraint): a DLT direct
+  update and a revocation for the SAME device i cannot coexist in any trace,
+  regardless of which occurred first. Both DirectUpdateAllow and RevokeDevice
+  require the linear fact Status(tag,'active') for device i's tag as a premiss
+  and consume it; a linear fact can be consumed at most once, so the two rule
+  applications are mutually exclusive.
+
+  This is strictly stronger than update_gatekeeping_dlt (which only covers
+  #r < #s). Here no ordering assumption is needed. Used by
+  post_revocation_update to close the DLT branch without expanding the
+  DeviceState backward chain (heuristic I would otherwise explore all
+  DeviceState sources before reaching the NetUpdate contradiction).
+*/
+lemma update_revoke_mutex_dlt [reuse]:
+  "All i tag e dz bfd sig #s #r.
+      UpdateServedByDLT(i, e, dz, bfd, sig)@#s
+    & Revoke(i, tag)@#r
+    ==> F"
+
+/*
+  Mutual-exclusion helper (relay path, no timing constraint): same argument
+  as update_revoke_mutex_dlt but for RelayForwardAllow, which also consumes
+  Status(tag,'active') for the requesting device i. Covers both orderings
+  (#s < #r and #r < #s), again strictly stronger than update_gatekeeping_relay.
+*/
+lemma update_revoke_mutex_relay [reuse]:
+  "All r i tag e dz bfd sig #s #r.
+      UpdateServedByRelay(r, i, e, dz, bfd, sig)@#s
+    & Revoke(i, tag)@#r
+    ==> F"
+
+/*
+  Mutual-exclusion helper (cumulative relay path, no timing constraint):
+  RelayServeCumulative also consumes Status(tag,'active') for device i.
+  Therefore CumulativeServedByRelay and Revoke for the same device i are
+  mutually exclusive. Used by post_revocation_update to close the
+  ApplyCumulativeUpdate branch instantly.
+*/
+lemma cumulative_revoke_mutex [reuse]:
+  "All r i tag e #c #r.
+      CumulativeServedByRelay(r, i, e)@#c
+    & Revoke(i, tag)@#r
+    ==> F"
+
+/*
+  Focused helper: if device i has a post-revocation DeviceAtEpoch(i,e) event
+  (i.e., applied an epoch-e update after being revoked), then a ForwardUpdate
+  (from a compromised device) preceded that ApplyUpdate. This separates the
+  update-chain reasoning from interaction reasoning.
+
+  NOTE on timing of ForwardUpdate relative to Revoke:
+  The claim is #fw < #ei (ForwardUpdate before the update application) but
+  NOT necessarily #r < #fw (ForwardUpdate after revocation). This is because
+  a compromised device can forward the NetUpdate to i BEFORE i is revoked
+  ("stale update" scenario). The NetUpdate then persists in the state and
+  ApplyUpdate can consume it AFTER revocation. In this case, #fw < #r < #ei.
+  The security guarantee is: the update required a compromised device's
+  involvement (ForwardUpdate) — whether that forwarding happened before or
+  after revocation is a race condition at revocation time that the protocol
+  accepts (the real verifier-side BF check would catch this case).
+
+  Proof: DeviceAtEpoch(i,e)@#ei comes from ApplyUpdate or ApplyCumulativeUpdate.
+  - ApplyCumulativeUpdate: needs NetCumulative from RelayServeCumulative, which
+    requires Status(tag,'active') for device i. After Revoke@#r, Status is
+    'revoked'. Contradiction — this branch closes immediately.
+  - ApplyUpdate: needs NetUpdate(src,i,e,...) and DeviceState(i,eI).
+    NetUpdate sources after #r: DirectUpdateAllow and RelayForwardAllow require
+    Status(tag,'active') → blocked by Revoke; excluded by update_gatekeeping
+    [reuse]. NetUpdate before #r: also can only come from ForwardUpdate
+    (at the time, Status was still 'active', but DLT/relay could still serve —
+    WAIT: actually if #fw < #r, Status was 'active' at #fw, so DirectUpdateAllow
+    or RelayForwardAllow COULD have produced NetUpdate before #r).
+
+  KEY MUTUAL EXCLUSION ARGUMENT (implemented via [reuse] mutex helpers):
+  DirectUpdateAllow, RelayForwardAllow, RelayServeCumulative, and RevokeDevice
+  ALL require Status(tag,'active') for device i as a linear premiss. Status is
+  one-shot — exactly one of these rules can fire for a given tag. Therefore
+  UpdateServedByDLT, UpdateServedByRelay, CumulativeServedByRelay, and Revoke
+  for the same device i are pairwise mutually exclusive (regardless of order).
+  Closed by update_revoke_mutex_dlt [reuse], update_revoke_mutex_relay [reuse],
+  and cumulative_revoke_mutex [reuse] respectively.
+
+  Remaining case: NetUpdate comes from ForwardUpdate(f,i,e) at #fw.
+  - ApplyCumulativeUpdate: cumulative_revoke_mutex → F ✓
+  - ApplyUpdate → NetUpdate from DLT: update_revoke_mutex_dlt → F ✓
+  - ApplyUpdate → NetUpdate from relay: update_revoke_mutex_relay → F ✓
+  - ApplyUpdate → NetUpdate from ForwardUpdate(f,i,e)@#fw: witness. Since
+    ForwardUpdate fires at #fw and ApplyUpdate fires at #ei, and NetUpdate
+    is produced by ForwardUpdate and consumed by ApplyUpdate, #fw < #ei ✓
+
+  NOTE on ForwardUpdate timing: ForwardUpdate can fire BEFORE OR AFTER Revoke
+  (it has no Status requirement for device i). A pre-staged NetUpdate from
+  ForwardUpdate(f,i,e)@#fw < #r can persist until ApplyUpdate at #ei > #r.
+  Therefore we claim #fw < #ei (ForwardUpdate before ApplyUpdate), NOT #r < #fw.
+  collusion_bounded (exists-trace) separately demonstrates the case where
+  Revoke fires before ForwardUpdate, i.e., the attacker must collude AFTER
+  revocation — that's the more security-relevant scenario.
+*/
+lemma post_revocation_update [reuse]:
+  "All i tag e #r #ei.
+      Revoke(i, tag)@#r
+    & DeviceAtEpoch(i, e)@#ei
+    & #r < #ei
+    ==> Ex f #fw. ForwardUpdate(f, i, e)@#fw & #fw < #ei"
+
+/*
+  Safety lemma: if device i obtained a post-revocation epoch update
+  (DeviceAtEpoch(i,e)@#ei with #r < #ei) and then interacted with j at
+  that epoch, a ForwardUpdate (collusion) event must have preceded
+  the epoch-update application (§14.3.2, revocation enforcement;
+  contrapositive of Theorem revocation_soundness part iii).
+
+  WHY DeviceAtEpoch(i,e) is required:
+  !FreshAt(i,e) is produced by BOTH IssueDevice (at issuance epoch, before
+  revocation) and ApplyUpdate/ApplyCumulativeUpdate (at any epoch). Without
+  the DeviceAtEpoch condition, the lemma is FALSIFIED: a device issued at
+  epoch e with !FreshAt(i,e) from IssueDevice, subsequently revoked, can
+  still fire InteractSuccess using its pre-revocation issuance freshness —
+  no ForwardUpdate needed. Tamarin finds this counterexample in 8 steps.
+
+  DeviceAtEpoch(i,e)@#ei is produced ONLY by ApplyUpdate and
+  ApplyCumulativeUpdate (not by IssueDevice). Requiring #r < #ei restricts
+  the claim to devices that applied an epoch update AFTER revocation. In
+  that case, the update necessarily came via ForwardUpdate, since:
+  - DirectUpdateAllow, RelayForwardAllow excluded by update_gatekeeping_dlt
+    and update_gatekeeping_relay [reuse] (both require Status(tag,'active'),
+    which RevokeDevice has already consumed).
+  - The only remaining NetUpdate source is ForwardUpdate(f, i, e).
+
+  Security meaning: "a revoked device cannot obtain a post-revocation epoch
+  credential and then use it to interact without collusion." The condition
+  #ei < #is explicitly requires that the post-revocation update PRECEDES the
+  interaction; without it, the lemma is falsifiable: a device issued at epoch
+  e can interact using issuance !FreshAt (pre-revocation), while a separate
+  later ForwardUpdate creates a distinct DeviceAtEpoch@#ei > #is > #r. In that
+  trace, no ForwardUpdate precedes #is but the antecedent holds — the lemma
+  would be vacuously violated.
+
+  Proof via post_revocation_update [reuse]:
+    - post_revocation_update gives ForwardUpdate(f,i,e)@#fw with #fw < #ei.
+    - #ei < #is (precondition) → #fw < #ei < #is → #fw < #is. ✓
+    - No backward exploration of DeviceInteract needed: the contradiction
+      (ForwardUpdate witness found via [reuse] + transitivity) is established
+      without case-splitting on DeviceState(j,e).
+
+  [reuse]: used as a sub-goal in epoch_exclusion.
+*/
+lemma revocation_enforcement [reuse]:
+  "All i j tag e #r #ei #is.
+      Revoke(i, tag)@#r
+    & DeviceAtEpoch(i, e)@#ei
+    & DeviceInteract(i, j, e)@#is
+    & #r < #ei
+    & #ei < #is
+    ==> Ex f #fw. ForwardUpdate(f, i, e)@#fw & #fw < #is"
+
+/*
+  Safety lemma: if device i obtained a post-revocation epoch-e update
+  (DeviceAtEpoch(i,e)@#ei with #r < #ei) AND j's epoch-e view was
+  established post-revocation (DeviceAtEpoch(j,e)@#ej with #r < #ej),
+  and they interact at epoch e, then ForwardUpdate must have occurred
+  between the revocation and the interaction (§14.3.2, Theorem
+  revocation_soundness part iii; Tamarin lemma epoch_exclusion).
+
+  Strengthens revocation_enforcement by additionally requiring
+  DeviceAtEpoch(j,e)@#ej with #r < #ej: j's view of epoch e was
+  established after i's revocation, confirming the interaction epoch
+  is genuinely post-revocation from j's perspective too. This models
+  the scenario where the interacting peer j is "aware" of the new epoch
+  (has Acc^e from an update applied after i's revocation).
+
+  WHY both DeviceAtEpoch conditions and #ei < #is are needed:
+  Same root cause as revocation_enforcement — !FreshAt from IssueDevice
+  does not require a post-revocation update, and #ei < #is is needed to
+  prevent the issuance-freshness falsification (see revocation_enforcement
+  comment). Both conditions ensure: i's post-revocation update (#r < #ei)
+  directly preceded the interaction (#ei < #is); j's view of epoch e was
+  established after i's revocation (#r < #ej), confirming the interaction
+  epoch is genuinely post-revocation from j's perspective.
+
+  Proof: by revocation_enforcement [reuse] (with #r < #ei & #ei < #is),
+  ForwardUpdate(f,i,e)@#fw with #fw < #is is obtained directly. The
+  DeviceAtEpoch(j,e)@#ej condition is additional context for the paper's
+  security theorem (Theorem revocation_soundness part iii) — j's update
+  being post-revocation confirms the interaction is not relying on j's
+  pre-revocation state.
+
+  [reuse]: may be referenced in downstream security arguments.
+*/
+lemma epoch_exclusion [reuse]:
+  "All i j tag e #r #ei #ej #is.
+      Revoke(i, tag)@#r
+    & DeviceAtEpoch(i, e)@#ei
+    & DeviceAtEpoch(j, e)@#ej
+    & DeviceInteract(i, j, e)@#is
+    & #r < #ei
+    & #ei < #is
+    ==> Ex f #fw. ForwardUpdate(f, i, e)@#fw & #fw < #is"
+
+/*
+  The exists-trace liveness lemmas (collusion_bounded and completeness) are
+  proven in attest_liveness.spthy, not here.
+
+  Reason: backward proof search for exists-trace goals in this full model loops
+  indefinitely due to DeviceState loop-breakers (6 rules reproduce DeviceState)
+  and the s/1 infinite epoch domain. The liveness file uses concrete epochs
+  'e0'/'e1' and the !HonestDevice fix for ForwardUpdate to eliminate all
+  loop-breakers. See tamarin-patterns.md Bug #10 for full details.
+
+  Witnesses verified:
+    collusion_bounded_witness : exists-trace — 26 steps, 5s (attest_liveness.spthy)
+    completeness_witness      : exists-trace — 37 steps, 54s (attest_liveness.spthy)
+*/
+
+/*
+  Liveness lemma: every cumulative update applied by a device was built
+  from genuine manager-published epoch updates (§14.3.2, catch-up
+  correctness). Formally: ReceivesCumulative(i,e2) implies a prior
+  CumulativeBuilt(e1,e2,...) event.
+
+  Proof chain:
+    ReceivesCumulative (from ApplyCumulativeUpdate)
+      <- DeviceState(i,eI)  [looping linear fact — ADVANCE pattern]
+      <- !CumulativeUpdate  (from BuildCumulativeFromTwo)
+        <- CumulativeBuilt action + two !PublishedUpdate facts.
+  Also: NetCumulative comes from RelayServeCumulative, which has
+  Status(tagR,'active') as a looping premiss.
+
+  [use_induction]: two loop sources require induction:
+  (1) DeviceState(i,eI) in ApplyCumulativeUpdate — backward search loops
+      on the device epoch chain. With [use_induction], Tamarin uses the
+      inductive hypothesis for ReceivesCumulative at shorter traces,
+      breaking the DeviceState chain.
+  (2) Status(tagR,'active') via RelayServeCumulative — same argument as
+      no_selective_omission. The inductive hypothesis on shorter traces
+      closes the Status loop.
+*/
+lemma catch_up_correctness [use_induction]:
+  "All i e2 #rc.
+      ReceivesCumulative(i, e2)@#rc
+    ==> Ex e1 dCum bCum #b.
+         CumulativeBuilt(e1, e2, dCum, bCum)@#b
+       & #b < #rc"
+
+/*
+  Secrecy lemma: the adversary cannot learn witness components (zi, c1, c2)
+  of honest device i without first compromising it (§14.3.2, witness secrecy;
+  symbolic analogue of Theorem wit-forge §14.2).
+
+  Proof: zi, c1, c2 are fresh nonces in !DeviceWitness(i,zi,c1,c2). The
+  only Out fact containing these terms is Out(<skI,zi,c1,c2,vc>) in
+  CompromiseDevice. K(<zi,c1,c2>) terminates in one step: zi, c1, c2 are
+  globally fresh and not derivable from any public term, so the backward
+  search on K() reaches CompromiseDevice immediately. !DeviceWitness being
+  persistent does not change this: the adversary has no direct store access;
+  only Out puts terms in the adversary's knowledge set.
+
+  No [use_induction]: the K() derivation chain does not involve looping
+  linear facts. zi, c1, c2 have a single output source and no Dolev-Yao
+  construction rule derives them from sub-terms (Tamarin manual p. 120).
+*/
+lemma witness_secrecy:
+  "All i zi c1 c2 #iss #k.
+      IssuedWitness(i, zi, c1, c2)@#iss
+    & K(<zi, c1, c2>)@#k
+    ==> Ex #c. Compromise(i)@#c & #c < #k"
+
+end
