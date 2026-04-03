@@ -21,8 +21,8 @@ and liveness.
 | Witness size | 4.2 KB (set1) / **8.2 KB (set2)** |
 | Epoch broadcast: add | 2.0 KB (set1) / **4.0 KB (set2)** |
 | Epoch broadcast: revoke | 13.7 KB (set1) / **15.7 KB (set2)** |
-| Verification time (Colab) | ~3 ms (set1) / **~100 ms (set2)** |
-| WitUpdate time | < 1 ms |
+| Verification time (Colab) | ~2 ms (set1) / **~44–107 ms (set2)** |
+| WitUpdate time | ~0.8 ms (set1) / ~1.5–2.4 ms (set2) |
 | Formal verification | 15 Tamarin lemmas — all verified |
 
 ---
