@@ -44,8 +44,8 @@ tamarin-prover attest_baseline.spthy --precompute-only
 
 | Lemma | Steps | Time | Description |
 |-------|-------|------|-------------|
-| `update_gatekeeping_dlt` | 154 | ~5 s | DLT never serves updates to a revoked device (Assumption B, DLT path) |
-| `update_gatekeeping_relay` | 186 | ~8 s | Honest relay never forwards updates to a revoked device (Assumption B, relay path) |
+| `update_gatekeeping_dlt` | 154 | ~5 s | DLT never serves updates to a revoked device (Assumption B1, DLT path) |
+| `update_gatekeeping_relay` | 186 | ~8 s | Honest relay never forwards updates to a revoked device (Assumption B1, relay path) |
 | `relay_fetch_implies_published` | 10 | ~2 s | Every relay-cached update was manager-published (helper) |
 | `no_selective_omission` | 49 | ~0 s | Relay-served updates carry ΔZ and BF_Δ atomically |
 | `update_revoke_mutex_dlt` | 33 | ~9 s | DLT update and revocation are mutually exclusive for the same device (helper) |

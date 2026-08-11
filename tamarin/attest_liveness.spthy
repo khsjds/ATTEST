@@ -8,7 +8,8 @@
   WHY A SEPARATE FILE IS NEEDED
   ------------------------------
   Both lemmas are non-terminating in attest_baseline.spthy due to DeviceState
-  loop-breakers under backward proof search. See tamarin-patterns.md Bug #10.
+  loop-breakers under backward proof search. See tamarin-patterns.md Bug #10
+  (moved to vault: Paper Writing/ATTEST/tamarin/tamarin-patterns.md).
 
   HOW THE LOOP-BREAKERS ARE ELIMINATED
   --------------------------------------

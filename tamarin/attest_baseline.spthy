@@ -975,7 +975,8 @@ lemma epoch_exclusion [reuse]:
   indefinitely due to DeviceState loop-breakers (6 rules reproduce DeviceState)
   and the s/1 infinite epoch domain. The liveness file uses concrete epochs
   'e0'/'e1' and the !HonestDevice fix for ForwardUpdate to eliminate all
-  loop-breakers. See tamarin-patterns.md Bug #10 for full details.
+  loop-breakers. See tamarin-patterns.md Bug #10 for full details (moved to vault:
+  Paper Writing/ATTEST/tamarin/tamarin-patterns.md).
 
   Witnesses verified:
     collusion_bounded_witness : exists-trace — 26 steps, 5s (attest_liveness.spthy)
