@@ -381,7 +381,7 @@ rule RelayFetchIfActive:
   (2) verify(tok, m, pk_i) = true via Equality — authenticates device i as
       the holder of credential vc; modelled by EUF-CMA of the signing builtin.
   (3) Status(tag,'active') — BF gate: H_tag(vc_i) ∉ BF, i.e., not revoked.
-      This is the formal encoding of Assumption B (§14.2).
+      This is the formal encoding of Assumption B1 (§IV-A).
 
   !DeviceCred is persistent (no reproduce). !DeviceTag is persistent (no
   reproduce). Status(tag,'active') is consumed (not reproduced): one-shot
@@ -643,7 +643,7 @@ rule InteractSuccess:
 
 /*
   Safety lemma (DLT path): the DLT never serves an epoch update to device i
-  after i is revoked (formal proof of Assumption B for the DLT, §14.2).
+  after i is revoked (formal proof of Assumption B1 for the DLT, §IV-A).
 
   Proof: DirectUpdateAllow requires Status(tag,'active') as a linear premiss.
   RevokeDevice requires the same fact and transitions it irreversibly to
@@ -668,7 +668,7 @@ lemma update_gatekeeping_dlt [reuse]:
 
 /*
   Safety lemma (relay path): an honest relay never forwards an epoch update
-  to device i after i is revoked (formal proof of Assumption B for relays).
+  to device i after i is revoked (formal proof of Assumption B1 for relays).
 
   Proof: identical mutual-exclusion argument to update_gatekeeping_dlt but
   for RelayForwardAllow, which also requires Status(tag,'active') for the
@@ -692,7 +692,7 @@ lemma update_gatekeeping_relay [reuse]:
   Combined safety lemma for paper Table 2 (update_gatekeeping). Conjoins
   the DLT and relay sub-lemmas as the single statement cited in Theorem
   revocation_soundness (§14.3, part i). This is the Tamarin-verified proof
-  of Assumption B (§14.2): every honest update source enforces the BF gate.
+  of Assumption B1 (§IV-A): every honest update source enforces the BF gate.
   The proof follows by [reuse] of update_gatekeeping_dlt and
   update_gatekeeping_relay; no additional proof work is needed here.
 */
